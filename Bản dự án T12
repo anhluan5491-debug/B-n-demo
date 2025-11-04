@@ -1,0 +1,615 @@
+/* --- T12 Soldering Station - STANDARD ESP32 (V4 Feature Unified) --- 
+ * MODIFIED Pin configuration for STANDARD ESP32
+ * *** PWM FUNCTIONS UNCOMMENTED: HEATER and BUZZER ENABLED ***
+ */
+#include <Arduino.h>
+#include <stdint.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <TFT_eSPI.h>
+#include <Adafruit_MAX31855.h>
+#include <Adafruit_INA3221.h>
+
+// ---------------- Pin definitions CONVERTED FOR STANDARD ESP32 ----------------
+// SPI/MAX31855/TFT pins unchanged, except BL
+#define PIN_MAX_CS 5
+#define PIN_MAX_CLK 18
+#define PIN_MAX_MISO 19
+
+#define PIN_TFT_CS 15
+#define PIN_TFT_DC 2
+#define PIN_TFT_RST 4
+#define PIN_TFT_BL 33
+
+// I2C PINS CONVERTED: USING COMMON I2C PINS
+#define PIN_INA_SDA 21
+#define PIN_INA_SCL 22
+
+#define PIN_ENC_A 35
+#define PIN_ENC_B 34
+#define PIN_ENC_BTN 25
+
+#define PIN_SW_A 13
+#define PIN_SW_B 12
+#define PIN_LIMIT 14
+
+#define PIN_MOSFET 26
+#define PIN_BUZZ 27
+#define BUZZ_PWM_CH 1
+#define MOSFET_PWM_CH 0
+
+// ---------------- Constants & Settings (Unified) ----------------
+#define MAX_TEMP 450.0
+#define MIN_TEMP 50.0
+const float SLEEP_TEMP_DEFAULT = 150.0;
+const unsigned int IDLE_TIMEOUT_MS_DEFAULT = 120000; // 2 minutes
+
+const unsigned int SENSOR_INTERVAL_MS = 100;
+const unsigned int CONTROL_INTERVAL_MS = 250;
+const unsigned int UI_INTERVAL_MS = 120;
+const unsigned int DEBOUNCE_DELAY_MS = 50;
+const unsigned long ENC_LONGPRESS_MS = 2000;
+const unsigned long MENU_TIMEOUT = 15000;
+const unsigned long ERROR_REPEAT_MS = 10000;
+
+// ---------------- Peripherals ----------------
+TFT_eSPI tft = TFT_eSPI();
+Adafruit_MAX31855 maxThermo(PIN_MAX_CLK, PIN_MAX_CS, PIN_MAX_MISO);
+Adafruit_INA3221 ina3221;
+
+// ---------------- App State ----------------
+enum StationState {
+    STATE_RUN,
+    STATE_SLEEP,
+    STATE_OFF,
+    STATE_MENU
+};
+StationState currentState = STATE_OFF;
+
+
+float setTemp = 320.0;
+float sleepTemp = SLEEP_TEMP_DEFAULT;
+unsigned long sleepTimeMs = IDLE_TIMEOUT_MS_DEFAULT;
+int sourceType = 2; // 0=12V, 1=18V, 2=24V (Default 12V)
+
+float realTemp = 25.0;
+float volt = 0.0, amp = 0.0, powerW = 0.0;
+int heaterDuty = 0;
+
+bool handpiecePresent = false;
+bool errorState = false; // Sensor Error
+bool sourceError = false; // Source Error
+String errorText = "";
+
+volatile long encPos = 0;
+volatile bool encMoved = false;
+long lastEncSnapshot = 0;
+bool encBtnState = true;
+unsigned long encBtnPressStart = 0;
+unsigned long menuLastInteraction = 0;
+int menuIndex = 0;
+ 
+unsigned long lastSensorRead = 0;
+unsigned long lastUIUpdate = 0;
+unsigned long lastControlUpdate = 0;
+unsigned long idleTimerStart = 0;
+unsigned long lastErrorBeep = 0;
+
+uint16_t setColor = 0;
+uint16_t tempColor = 0;
+uint16_t powerTextColor = 0;
+
+// ---------------- Menu Function Declarations ----------------
+void drawStaticUI();
+void updateMenuDisplay();
+void enterMenu();
+void exitMenu();
+void confirmMenuAction();
+void showSaved();
+void showErrorScreen(const String &msg);
+
+// ---------------- Utility: color helpers ----------------
+uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
+  return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+}
+
+uint16_t lerpColor16(uint16_t c1, uint16_t c2, float a) {
+  int r1=(c1>>11)&0x1F,g1=(c1>>5)&0x3F,b1=c1&0x1F;
+  int r2=(c2>>11)&0x1F,g2=(c2>>5)&0x3F,b2=c2&0x1F;
+  int r=(int)(r1+(r2-r1)*a),g=(int)(g1+(g2-g1)*a),b=(int)(b2+(b2-b1)*a);
+  return (r<<11)|(g<<5)|b;
+}
+
+uint16_t tempToColorSmooth(float t){
+  if(t<0)t=0;if(t>MAX_TEMP)t=MAX_TEMP;
+  uint8_t r,g,b;
+  // Modified color scheme: 0-250C (Blue-Yellow); 250C-MAX (Yellow-Red)
+  if(t<250){float k=t/250.0;r=(uint8_t)(255*k);g=255;b=0;}
+  else{float k=(t-250.0)/(MAX_TEMP-250.0);r=255;g=(uint8_t)(255*(1.0-k));b=0;}
+  return rgb565(r,g,b);
+}
+const float MAX_POWER = 60.0; // Assumed max power (for color display purposes)
+uint16_t powerToTextColor(float p) {
+  float t = p / MAX_POWER;
+  if (t < 0) t = 0;
+  if (t > 1) t = 1;
+  uint8_t r, g;
+  // Green (0W) -> Yellow (30W) -> Red (60W)
+  if (t < 0.5) {
+    r = (uint8_t)(t * 2 * 255);
+    g = 255;
+  } else {
+    r = 255;
+    g = (uint8_t)(255 * (1.0 - (t - 0.5)*2));
+  }
+  return rgb565(r,g,0);
+}
+
+// ---------------- Buzzer (PWM logic ENABLED) ----------------
+void buzzerTone(unsigned int freq) {
+    if (freq == 0) ledcWrite(BUZZ_PWM_CH, 0);
+    else ledcWriteTone(BUZZ_PWM_CH, freq);
+  }
+
+void beep(int times = 1, int freq = 2000, int dur = 80, int gap = 60) {
+    for (int i=0;i<times;i++){
+        buzzerTone(freq);
+        delay(dur);
+        buzzerTone(0);
+        if (i < times-1) delay(gap);
+    }
+}
+
+// ---------------- Encoder ISR ----------------
+void IRAM_ATTR encA() {
+    bool a = digitalRead(PIN_ENC_A);
+    bool b = digitalRead(PIN_ENC_B);
+    if (a == b) encPos++; else encPos--;
+    encMoved = true;
+}
+void IRAM_ATTR encB() {
+    bool a = digitalRead(PIN_ENC_A);
+    bool b = digitalRead(PIN_ENC_B);
+    if (a != b) encPos++; else encPos--;
+    encMoved = true;
+}
+
+// ---------------- Heater Control ----------------
+void setHeaterOutput(int duty) {
+    duty = constrain(duty, 0, 255);
+    ledcWrite(MOSFET_PWM_CH, duty); // ENABLED
+    heaterDuty = duty;
+}
+
+void pidControl(float targetTemp) {
+    if (isnan(realTemp) || realTemp < 0.0 || !handpiecePresent) {
+        setHeaterOutput(0);
+        return;
+    }
+
+    float err = targetTemp - realTemp;
+    if (err <= 0) {
+        setHeaterOutput(0);
+    } else {
+        float Kp = 1.2;
+        int output = constrain((int)(err * Kp), 0, 255);
+        setHeaterOutput(output);
+    }
+}
+
+// ---------------- Sensors Reading ----------------
+void readTempSensor() {
+    double t = maxThermo.readCelsius();
+    uint8_t error = maxThermo.readError();
+    
+    if (error != 0) {
+        if (!errorState) {
+            errorState = true;
+            errorText = "SENSOR ERROR"; // Placeholder
+            showErrorScreen(errorText);
+            beep(3, 1200, 300, 120); // ENABLED
+            lastErrorBeep = millis();
+        }
+        realTemp = NAN;
+    } else if (!isnan(t)) {
+        if (errorState) {
+            errorState = false;
+            beep(2, 2000, 80, 60); // ENABLED
+            drawStaticUI();
+        }
+        realTemp = t;
+    }
+}
+
+void readINA() {
+    volt = ina3221.getBusVoltage(1);
+    amp = ina3221.getCurrentAmps(1);
+    powerW = volt * amp;
+    if (powerW < 0.0) powerW = 0.0;
+}
+
+// ---------------- SOURCE VOLTAGE CHECK ----------------
+void checkSourceVoltage() {
+    float minV;
+    if (sourceType == 0) minV = 11.0;
+    else if (sourceType == 1) minV = 15.0;
+    else minV = 23.0; // 24V
+
+    if (volt < minV) {
+        if (!sourceError) {
+            sourceError = true;
+            errorText = "LOW VOLTAGE!"; // Placeholder
+            showErrorScreen(errorText);
+            tft.drawString("V: "+String(volt,1)+"V",tft.width()/2,tft.height()/2+30,2);
+            beep(3, 1000, 300, 120); // ENABLED
+        }
+        setHeaterOutput(0);
+    } else if (sourceError) {
+        sourceError = false;
+        drawStaticUI();
+    }
+}
+
+// ---------------- UI DETAIL FUNCTIONS ----------------
+// Draw V, A, W values
+void drawPowerNumbers(uint16_t textColorLocal) {
+    int startX = 6, w = 96, gap = 6;
+    tft.setTextDatum(MC_DATUM);
+    uint16_t boxBg = rgb565(10,50,80);
+    tft.setTextColor(textColorLocal, boxBg);
+    tft.drawString(String(volt,1)+"V", startX + w/2, 34, 4);
+    tft.drawString(String(amp,2)+"A", startX + (w+gap) + w/2, 34, 4);
+    tft.drawString(String(powerW,1)+"W", startX + 2*(w+gap) + w/2, 34, 4);
+}
+
+void drawSetBox(uint16_t bgColor) {
+    // Set temp box
+    tft.fillRoundRect(6, 58, 120, 70, 8, bgColor);
+    tft.setTextColor(TFT_BLACK, bgColor);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("SET", 6+120/2, 64, 2); // Set label
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_BLACK, bgColor);
+    tft.drawString(String((int)setTemp) + "C", 6+120/2, 58+70/2 + 8, 4);
+
+    // PWM Bar (Duty Cycle)
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextSize(1);
+    tft.setCursor(6, tft.height() - 25);
+    tft.setTextColor(TFT_DARKGREY);
+    tft.print("DUTY:");
+    int barWidth = (int)((float)heaterDuty / 255.0 * 110.0);
+    tft.drawRect(6, tft.height() - 15, 110, 8, TFT_DARKGREY);
+    tft.fillRect(7, tft.height() - 14, barWidth - 1, 6, TFT_RED);
+}
+
+// Draw large actual temperature
+void drawTempBig(float temp, uint16_t tColor) {
+    tft.fillRect(132, 58, tft.width()-132, 80, TFT_BLACK);
+    tft.setTextDatum(ML_DATUM);
+    tft.setTextColor(tColor, TFT_BLACK);
+    tft.drawString(String((int)temp) + "C", 132+6, 58+30, 7);
+}
+
+void drawStaticUI() {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);
+    int startX = 6, w = 96, h = 44, gap = 6;
+    uint16_t boxBg = rgb565(10,50,80);
+   
+    for(int i=0;i<3;i++){
+        int x=startX+i*(w+gap);
+        tft.fillRoundRect(x,6,w,h,6,boxBg);
+        tft.setTextColor(TFT_WHITE,boxBg);
+        if(i==0)tft.drawString("V",x+w/2,12,2);
+        if(i==1)tft.drawString("A",x+w/2,12,2);
+        if(i==2)tft.drawString("W",x+w/2,12,2);
+    }
+    
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString("Status:", 132, tft.height() - 20, 2);
+}
+
+void showErrorScreen(const String &msg) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(rgb565(255,50,50), TFT_BLACK);
+    tft.drawString("SYSTEM ERROR:", tft.width()/2, tft.height()/2 - 30, 4); // System Error
+    tft.drawString(msg, tft.width()/2, tft.height()/2 + 10, 4);
+}
+
+void showSaved() {
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.drawString("SAVED", tft.width()/2, tft.height() - 20, 2); // Saved
+    delay(600);
+}
+
+// ---------------- MENU FUNCTIONS ----------------
+const int MENU_ITEMS = 4;
+int menuValues[MENU_ITEMS];
+bool menuEditing = false;
+
+void showMenuScreen() {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(ML_DATUM);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString("> SETTINGS MENU", 10, 6, 2); // Settings Menu
+    updateMenuDisplay();
+}
+
+void updateMenuDisplay() {
+    // Sync current values
+    menuValues[0] = (int)setTemp;
+    menuValues[1] = (int)sleepTemp;
+    menuValues[2] = (int)(sleepTimeMs / 1000UL);
+    menuValues[3] = sourceType;
+
+    int baseY = 40;
+    for (int i=0;i<MENU_ITEMS;i++) {
+        int y = baseY + i*36;
+        uint16_t bgColor = (i == menuIndex) ? rgb565(30,30,30) : TFT_BLACK;
+        if (i == menuIndex && menuEditing) bgColor = rgb565(100,50,0); // Color when editing
+        
+        tft.fillRect(6, y-6, tft.width()-12, 30, bgColor);
+        tft.setTextColor((i == menuIndex) ? TFT_YELLOW : TFT_WHITE, bgColor);
+        
+        String label;
+        if (i==0) label = "Set Temp: " + String(menuValues[0]) + "C"; // Set Temp
+        if (i==1) label = "Sleep Temp: " + String(menuValues[1]) + "C"; // Sleep Temp
+        if (i==2) label = "Sleep Time: " + String(menuValues[2]) + "s"; // Sleep Time (s)
+        if (i==3) { 
+             String src = (menuValues[3]==0)?"12V":(menuValues[3]==1)?"18V":"24V";
+             label = "Source: " + src; // Source Type
+        }
+        tft.drawString(label, 12, y, 2);
+    }
+}
+
+void enterMenu() {
+    currentState = STATE_MENU;
+    menuEditing = false;
+    menuLastInteraction = millis();
+    showMenuScreen();
+    beep(2, 2000, 80, 60); // ENABLED
+}
+
+void exitMenu() {
+    // FIX: Reset idleTimerStart when exiting menu to RUN
+    handpiecePresent = digitalRead(PIN_LIMIT) == LOW;
+    if (!handpiecePresent) currentState = STATE_OFF;
+    else {
+        currentState = STATE_RUN;
+        idleTimerStart = millis(); // Reset timer when returning to RUN
+    }
+ 
+    menuEditing = false;
+    drawStaticUI();
+    beep(2, 2000, 80, 60); // ENABLED
+}
+
+void confirmMenuAction() {
+    if (!menuEditing) {
+        menuEditing = true;
+        menuLastInteraction = millis();
+        updateMenuDisplay();
+    } else {
+        setTemp = (float)menuValues[0];
+        sleepTemp = (float)menuValues[1];
+        sleepTimeMs = (unsigned long)menuValues[2] * 1000UL;
+        sourceType = menuValues[3];
+        
+        menuEditing = false;
+        menuLastInteraction = millis();
+        showSaved(); // Show saved notification
+        updateMenuDisplay();
+    }
+}
+
+// ---------------- Input Handling ----------------
+void handleEncoder() {
+    // Get Encoder position change
+    if (encMoved) {
+        noInterrupts();
+        long pos = encPos;
+        encMoved = false;
+        interrupts();
+        long delta = pos - lastEncSnapshot;
+        lastEncSnapshot = pos;
+
+        if (delta != 0) {
+            menuLastInteraction = millis();
+            if (currentState == STATE_MENU) {
+                if (!menuEditing) {
+                    // Move between menu items
+                    menuIndex += (delta > 0) ? 1 : -1;
+                    if(menuIndex<0)menuIndex=MENU_ITEMS-1;
+                    if(menuIndex>=MENU_ITEMS)menuIndex=0;
+                    updateMenuDisplay();
+                } else {
+                    // Edit value
+                    int step = (delta > 0) ? 5 : -5;
+                    if (menuIndex == 0) menuValues[0] = constrain(menuValues[0]+step, 50, (int)MAX_TEMP); // Running Temp
+                    else if (menuIndex == 1) menuValues[1] = constrain(menuValues[1]+step, 50, 300); // Sleep Temp
+                    else if (menuIndex == 2) menuValues[2] = constrain(menuValues[2]+(delta>0?10:-10), 10, 600); // Sleep Time (s)
+                    else if (menuIndex == 3) { // Source Type
+                        menuValues[3] += (delta > 0) ? 1 : -1;
+                        if(menuValues[3]<0)menuValues[3]=2;
+                        if(menuValues[3]>2)menuValues[3]=0;
+                    }
+                    updateMenuDisplay();
+                }
+            } else if (currentState == STATE_RUN) {
+                // Quick set temp adjust
+                setTemp += delta * 5.0;
+                setTemp = constrain(setTemp, MIN_TEMP, MAX_TEMP);
+            }
+        }
+    }
+    bool currentEncBtn = digitalRead(PIN_ENC_BTN);
+    if (!currentEncBtn && encBtnState) {
+        encBtnPressStart = millis();
+    } else if (currentEncBtn && !encBtnState) {
+        unsigned long pressDuration = millis() - encBtnPressStart;
+        if (pressDuration >= ENC_LONGPRESS_MS) {
+            if (currentState != STATE_MENU) enterMenu();
+            else exitMenu();
+        } else if (pressDuration > DEBOUNCE_DELAY_MS) {
+            if (currentState == STATE_MENU) confirmMenuAction();
+            else beep(1, 3000, 60, 0); // ENABLED
+        }
+    }
+    encBtnState = currentEncBtn;
+}
+
+// ---------------- State & Button Logic ----------------
+void handleStateTransitions() {
+    handpiecePresent = digitalRead(PIN_LIMIT) == LOW;
+
+    // 1. Handpiece Plug/Unplug Logic (OFF <-> RUN)
+    if (!handpiecePresent && currentState != STATE_OFF) {
+        currentState = STATE_OFF;
+        setHeaterOutput(0);
+        idleTimerStart = 0;
+        drawStaticUI();
+    }
+    else if (handpiecePresent && currentState == STATE_OFF) {
+        currentState = STATE_RUN;
+        idleTimerStart = millis(); // Reset timer when transitioning from OFF to RUN
+        beep(1, 1000);
+        drawStaticUI();
+    }
+
+    // 2. Timeout Logic (RUN -> SLEEP)
+    if (currentState == STATE_RUN && handpiecePresent) {
+        if (millis() - idleTimerStart > sleepTimeMs) {
+            currentState = STATE_SLEEP;
+            // FIX: Removed vietnamese Serial.println message
+            Serial.println("Transitioning to sleep due to timeout"); 
+            beep(3, 500);
+        }
+    }
+
+    // 3. SW_B Button Logic (Manual RUN <-> SLEEP toggle)
+    if (digitalRead(PIN_SW_B) == LOW) {
+      if (currentState == STATE_RUN) {
+          currentState = STATE_SLEEP;
+      } else if (currentState == STATE_SLEEP) {
+          currentState = STATE_RUN;
+          idleTimerStart = millis(); // FIX: Added semicolon and reset timer
+      }
+
+      delay(200); // Debounce
+    }
+}
+
+// ---------------- Setup ----------------
+void setup() {
+    Serial.begin(115200);
+    delay(200);
+
+    pinMode(PIN_ENC_A, INPUT_PULLUP);
+    pinMode(PIN_ENC_B, INPUT_PULLUP);
+    pinMode(PIN_ENC_BTN, INPUT_PULLUP);
+    pinMode(PIN_SW_A, INPUT_PULLUP);
+    pinMode(PIN_SW_B, INPUT_PULLUP);
+    pinMode(PIN_LIMIT, INPUT_PULLUP);
+
+    attachInterrupt(digitalPinToInterrupt(PIN_ENC_A), encA, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(PIN_ENC_B), encB, CHANGE);
+
+    ledcSetup(MOSFET_PWM_CH, 2000, 8);
+    ledcAttachPin(PIN_MOSFET, MOSFET_PWM_CH);
+    ledcSetup(BUZZ_PWM_CH, 2000, 8);
+    ledcAttachPin(PIN_BUZZ, BUZZ_PWM_CH);
+    buzzerTone(0);
+
+    SPI.begin(PIN_MAX_CLK, PIN_MAX_MISO, -1, PIN_MAX_CS);
+    Wire.begin(PIN_INA_SDA, PIN_INA_SCL); 
+    if (!ina3221.begin()) Serial.println("INA3221 not found!"); // INA3221 not found
+
+    // TFT init
+    tft.init();
+    tft.setRotation(1);
+    tft.fillScreen(TFT_BLACK);
+
+    handpiecePresent = digitalRead(PIN_LIMIT) == LOW;
+    currentState = handpiecePresent ? STATE_RUN : STATE_OFF;
+    if (handpiecePresent) idleTimerStart = millis();
+
+    beep(3, 2000, 50, 40);
+}
+
+// ---------------- Loop ----------------
+void loop() {
+    unsigned long now = millis();
+
+    handleEncoder();
+    handleStateTransitions();
+
+    if (now - lastSensorRead >= SENSOR_INTERVAL_MS) {
+        readTempSensor();
+        readINA();
+        if (handpiecePresent) checkSourceVoltage();
+        lastSensorRead = now;
+    }
+ 
+    if (errorState || sourceError) {
+        setHeaterOutput(0);
+        if (now - lastErrorBeep > ERROR_REPEAT_MS) {
+            beep(3, 1200, 300, 120);
+            lastErrorBeep = now;
+        }
+        delay(10);
+        return;
+    }
+
+    if (now - lastControlUpdate >= CONTROL_INTERVAL_MS) {
+        if (currentState == STATE_RUN && handpiecePresent) {
+            pidControl(setTemp);
+            // No reset idleTimerStart here, relying on encoder interaction for idle reset
+        Nếu không thì nếu (currentState == STATE_SLEEP & handpiecePresent)
+            pidControl (sleepTemp);
+        Khác {
+            SetHeater Output (0);
+        }
+        Cập nhật LastControlUpdate = ngay bây giờ;
+        }
+    
+    if (bây giờ - lastUIUpdate >= UI_INTERVAL_MS) {
+        lastUIUpdate = now;
+        
+        if (currentState == STATE_MENU) {
+            
+            Nếu (bây giờ - menuLastInteraction > MENU_TIMEOUT) thoát Menu();
+        } else if (currentState == STATE_OFF) {
+            
+            tft.setTextDatum(TL_DATUM);
+            tft.setTextColor(TFT_RED, TFT_Black);
+            tft.drawString(String("Status: UNPLUGED"), 132, tft.height() - 20, 2); // Trạng thái: UNPLUGED
+        Khác {
+            float displayTemp = isnan(realTemp) ? 0 : RealTemp;
+
+            uint16_t targetSetColor = tempToColorSmooth(setTemp);
+            setColor = lerpColor16 (setColor, targetSetColor, 0.2);
+            drawSetBox (setColor);
+
+            uint16_t targetTempColor = tempToColorSmooth(displayTemp);
+            tempColor = lerpColor16 (tempColor, targetTempColor, 0.2);
+            drawTempBig (displayTemp, tempColor);
+
+            uint16_t targetPowerText = powerToTextColor(powerW);
+            powerTextColor = lerpColor16 (powerTextColor, targetPowerText, 0.2);
+            drawPowerNumbers (powerTextColor);
+            
+            tft.setTextDatum(TL_DATUM);
+            tft.setTextColor(TFT_GREEN, TFT_Black);
+            Trạng thái chuỗi = (currentState == STATE_SLEEP) ? "SLEEP" : "RUN"; // SLEEP hoặc RUN
+            tft.drawString(String("Status: ") + status, 132, tft.height() - 20, 2);
+        }
+        }
+
+    Trì hoãn (1);
+}
+
