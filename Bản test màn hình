@@ -1,0 +1,37 @@
+Bao gồm Arduino.h>
+#include <TFT_eSPI.h>
+
+// Định nghĩa các chân theo đúng wiring của bạn
+#define PIN_TFT_CS   15
+#define PIN_TFT_DC    2
+#define PIN_TFT_RST   4
+#define PIN_TFT_BL   33
+
+TFT_eSPI tft = TFT_eSPI(); // Sử dụng cấu hình từ User_Setup.h
+
+void setup() {
+  Serial.begin(115200);
+  delay(200); // Đợi khởi động
+
+  // Đèn nền (Backlight)
+  pinMode(PIN_TFT_BL, OUTPUT);
+  digitalWrite(PIN_TFT_BL, HIGH); // Đa số màn hình TFT_eSPI dùng HIGH để bật đèn, thử lại với LOW nếu chưa sáng
+
+  // Khởi tạo màn hình
+  tft.init();
+  tft.setRotation(1);  // Xoay màn hình nếu cần
+
+  // Xóa màn hình và vẽ nội dung test
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("TFT_eSPI Test", tft.width()/2, tft.height()/2, 4);
+  tft.setTextColor(TFT_RED, TFT_BLACK);
+  tft.drawString("Xin chao!", tft.width()/2, tft.height()/2+40, 4);
+
+  Serial.println("Da khoi tao TFT, da hien test!");
+}
+
+void loop() {
+  // Không cần lặp gì thêm
+}
